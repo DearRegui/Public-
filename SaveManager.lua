@@ -49,6 +49,23 @@ local SaveManager = {} do
     -- having to open the JSON file manually.
     SaveManager.Debug = false
 
+    --// Per-item text registry \\--
+    -- Maps  dropdownIdx  →  { GetNote(key)→string, SetNote(key, text) }
+    -- Registered via  SaveManager:RegisterDropdownNotes(idx, options)
+    -- Lets any dropdown save/load a block of text per list entry
+    -- (e.g. a "Notes" dropdown where each item has its own body text).
+    SaveManager.DropdownNotes = {}
+
+    function SaveManager:RegisterDropdownNotes(idx, options)
+        -- options must contain:
+        --   GetNote  = function(key: string) → string
+        --   SetNote  = function(key: string, text: string)
+        assert(type(options) == "table",             "RegisterDropdownNotes: options must be a table")
+        assert(type(options.GetNote) == "function",  "RegisterDropdownNotes: options.GetNote must be a function")
+        assert(type(options.SetNote) == "function",  "RegisterDropdownNotes: options.SetNote must be a function")
+        self.DropdownNotes[idx] = options
+    end
+
     --// Internal debug printer \\--
     local function DebugLog(action, name, objects)
         if not SaveManager.Debug then return end
@@ -78,6 +95,17 @@ local SaveManager = {} do
                     local opts = {}
                     for _, v in ipairs(obj.values) do opts[#opts + 1] = tostring(v) end
                     entry = entry .. "  (" .. table.concat(opts, ", ") .. ")"
+                end
+                -- Show per-item notes if present
+                if type(obj.notes) == "table" then
+                    local noteCount = 0
+                    for _ in pairs(obj.notes) do noteCount += 1 end
+                    entry = entry .. "  [notes: " .. noteCount .. "]"
+                    for k, v in pairs(obj.notes) do
+                        local preview = tostring(v)
+                        if #preview > 40 then preview = preview:sub(1, 37) .. "..." end
+                        entry = entry .. "\n          [" .. tostring(k) .. '] "' .. preview .. '"'
+                    end
                 end
             elseif t == "Toggle" then
                 entry = entry .. " = " .. tostring(obj.value)
@@ -129,13 +157,12 @@ local SaveManager = {} do
             end,
         },
         Dropdown = {
-            -- Saves both the selected value AND the full options list so the
-            -- dropdown can be completely reconstructed on load even if the
-            -- script hasn't populated it yet (e.g. dynamic player lists).
+            -- Saves the selected value, the full options list, and (if registered)
+            -- the per-item text (notes) for every entry in the list.
             Save = function(idx, object)
-                -- Serialise the Values list as a plain array of strings.
+                -- Serialise the Values list as a plain array.
                 -- Non-string/number entries (Instances, etc.) are skipped
-                -- because they can't survive a JSON round-trip.
+                -- because they cannot survive a JSON round-trip.
                 local savedValues = {}
                 if type(object.Values) == "table" then
                     for _, v in ipairs(object.Values) do
@@ -146,21 +173,34 @@ local SaveManager = {} do
                     end
                 end
 
+                -- Collect per-item notes when this dropdown is registered.
+                local notes = nil
+                local reg = SaveManager.DropdownNotes[idx]
+                if reg then
+                    notes = {}
+                    for _, v in ipairs(savedValues) do
+                        local key  = tostring(v)
+                        local text = reg.GetNote(key)
+                        -- Always write the entry (even empty string) so Load
+                        -- can tell the difference between "no note" and "missing key".
+                        notes[key] = (type(text) == "string") and text or ""
+                    end
+                end
+
                 return {
                     type   = "Dropdown",
                     idx    = idx,
                     value  = object.Value,
                     multi  = object.Multi,
                     values = savedValues,   -- full options list
+                    notes  = notes,         -- { [key] = "text" } or nil
                 }
             end,
             Load = function(idx, data)
                 local object = SaveManager.Library.Options[idx]
                 if not object then return end
 
-                -- Step 1: restore the options list when it was saved.
-                -- Only overwrites when the lists actually differ to avoid
-                -- unnecessary UI rebuilds.
+                -- Step 1: restore the options list when it was saved and differs.
                 if type(data.values) == "table" and #data.values > 0 then
                     local same = (#data.values == #object.Values)
                     if same then
@@ -173,7 +213,15 @@ local SaveManager = {} do
                     end
                 end
 
-                -- Step 2: restore the selected value.
+                -- Step 2: restore per-item notes when registered and data exists.
+                local reg = SaveManager.DropdownNotes[idx]
+                if reg and type(data.notes) == "table" then
+                    for key, text in pairs(data.notes) do
+                        reg.SetNote(tostring(key), tostring(text))
+                    end
+                end
+
+                -- Step 3: restore the selected value.
                 if object.Multi then
                     -- Multi: data.value is {[name]=true}. Table refs are never
                     -- equal so skip the ~= check; guard nil → empty table.
